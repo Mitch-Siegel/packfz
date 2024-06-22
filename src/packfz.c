@@ -3264,6 +3264,7 @@ void fuzz_results_term(fuzz_results_t *results)
 
 void fuzz_results_add(fuzz_results_t *results, char *str)
 {
+    
     for(size_t scanned_idx = 0; scanned_idx < results->outputs.len; scanned_idx++)
     {
         char *existing_str = results->outputs.buf[scanned_idx];
@@ -3363,7 +3364,7 @@ char *string_append(char *str, char *to_add)
 
 #define DEFAULT_MAX_EXPANSION_DEPTH 8
 #define DEFAULT_MAX_STAR_EXPANSION 1
-#define DEFAULT_MIN_FUZZ_LENGTH 5
+#define DEFAULT_MIN_FUZZ_LENGTH 2
 // #define PRINT_DEPTH_LIMIT_EXCEEDED (deoth) print_indent(depth); printf("depth limit exceeded - abandon\n");
 #define PRINT_DEPTH_LIMIT_EXCEEDED
 #define CHECK_EXPANSION_DEPTH(depth, maxdepth) if((depth) > (maxdepth)) { PRINT_DEPTH_LIMIT_EXCEEDED(depth); return NULL;}
@@ -3419,6 +3420,52 @@ static fuzz_results_t *fuzz_expand_string(context_t *ctx, node_string_t *string,
     return results;
 }
 
+static fuzz_results_t *fuzz_chars_in_range(context_t *ctx, fuzz_results_t *results, char start, char end, char *appended_in_str, size_t char_index, bool_t invert)
+{
+    if(ctx->opts.stochastic)
+    {
+        char rand_char = '\0';
+        if(!invert)
+            {
+                while (!(rand_char >= start && rand_char <= end))
+                {
+                    rand_char = rand() % ('~' - ' ');
+                }
+            }
+            else
+            {
+                if(rand_char >= start && rand_char <= end)
+                {
+                    rand_char = rand() % ('~' - ' ');
+                }
+            }
+        appended_in_str[char_index] = rand_char;
+        fuzz_results_add(results, appended_in_str);
+    }
+    else
+    {
+        for(char c = ' '; c <= '~'; c++)
+        {
+            if(!invert)
+            {
+                if(!(c >= start && c <= end))
+                {
+                    appended_in_str[char_index] = c;
+                }
+            }
+            else
+            {
+                if(c >= start && c <= end)
+                {
+                    appended_in_str[char_index] = c;
+                }
+            }
+
+            fuzz_results_add(results, appended_in_str);
+        }
+    }
+}
+
 static fuzz_results_t *fuzz_expand_charclass(context_t *ctx, node_charclass_t *charclass, size_t depth, char *in_str)
 {
     CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
@@ -3429,45 +3476,59 @@ static fuzz_results_t *fuzz_expand_charclass(context_t *ctx, node_charclass_t *c
     char *appended_char_string = string_append(strdup(in_str), " ");
     size_t char_index = strlen(in_str);
 
+    char *value = charclass->value;
     char start;
     char end;
     // TODO: support inverse class matching ex. [^0-9]
     if(charclass->value == NULL)
     {
-        start = '0';
-        end = '~';
-
+        fuzz_chars_in_range(ctx, results, 0, 128, appended_char_string, char_index, FALSE);
     }
     else
     {
-        if(charclass->value[0] == '^')
+        const size_t n = strlen(charclass->value);
+        if(n > 0)
         {
-            // TODO: properly implement this
-            start = '!';
-            end = '!';
-        }
-        char start = charclass->value[0];
-        char end = charclass->value[2];
-
-        if(start > end)
-        {
-            start = charclass->value[2];
-            end = charclass->value[0];
-        }
-    }
-
-    if(ctx->opts.stochastic)
-    {
-        char rand_char = (rand() % ('~' - '0')) + '0';
-        appended_char_string[char_index] = rand_char;
-        fuzz_results_add(results, appended_char_string);
-    }
-    else
-    {
-        for(char any = start; any <= end; any++)
-        {
-            appended_char_string[char_index] = any;
-            fuzz_results_add(results, appended_char_string);
+            if(n > 1)
+            {
+                const bool_t is_inverted_class = (value[0] == '^') ? TRUE : FALSE;
+                size_t i = is_inverted_class ? 1 : 0;
+                if (i + 1 == n)
+                {
+                    appended_char_string[char_index] = value[i];
+                    fuzz_results_add(results, appended_char_string);
+                }
+                else
+                {
+                    if((i+3 == n) && (value[i] != '\\') && value[i+1] == '-')
+                    {
+                        fuzz_chars_in_range(ctx, results, value[i], value[i + 2], appended_char_string, char_index, is_inverted_class);
+                    }
+                    else
+                    {
+                        if(ctx->opts.stochastic)
+                        {
+                            size_t rand_from_class_idx = rand() % (n - i);
+                            rand_from_class_idx += i;
+                            appended_char_string[char_index] = value[rand_from_class_idx];
+                            fuzz_results_add(results, appended_char_string);
+                        }
+                        else
+                        {
+                            for(; i < n; i++)
+                            {
+                                appended_char_string[char_index] = value[i];
+                                fuzz_results_add(results, appended_char_string);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                appended_char_string[char_index] = charclass->value[0];
+                fuzz_results_add(results, appended_char_string);
+            }
         }
     }
 
@@ -3491,6 +3552,13 @@ static fuzz_results_t *fuzz_expand_quantity(context_t *ctx, node_quantity_t *qua
     if(max_count == -1)
     {
         max_count = ctx->opts.maxstar;
+    }
+
+    if(max_count < min_count)
+    {
+        int temp = max_count;
+        max_count = min_count;
+        min_count = temp;
     }
 
     int rand_count;
@@ -3739,6 +3807,7 @@ static fuzz_results_t *fuzz_expand(context_t *ctx, node_t *node, size_t depth, c
 #include "time.h"
 static bool_t fuzz(context_t *ctx)
 {
+    printf("fuzzing %s with max depth of %d\n", ctx->opts.stochastic ? "stochastically" : "", ctx->opts.maxdepth);
     srand(time(0));
 
     fuzz_results_t *results = create_new_fuzz_results("");
@@ -3752,8 +3821,6 @@ static bool_t fuzz(context_t *ctx)
             return FALSE;
         }
         results = fuzz_results_merge(results, fuzz_expand(ctx, rule_node, 0, ""));
-
-        printf("\n");
     }
 
     size_t n_all_whitespace = fuzz_results_filter(ctx, results);
@@ -3886,7 +3953,6 @@ int main(int argc, char **argv) {
                 }
                 else if (strcmp(argv[i], "--max-star") == 0) {
                     const char *const v = (++i < argc) ?  argv[i] : NULL;
-                    printf("V:[%s]\n", v);
                     if (v == NULL || v[0] == '\0') {
                         print_error("Depth argument missing\n");
                         fprintf(stderr, "\n");
@@ -3897,7 +3963,6 @@ int main(int argc, char **argv) {
                 }
                 else if (strcmp(argv[i], "--min-length") == 0) {
                     const char *const v = (++i < argc) ?  argv[i] : NULL;
-                    printf("V:[%s]\n", v);
                     if (v == NULL || v[0] == '\0') {
                         print_error("Depth argument missing\n");
                         fprintf(stderr, "\n");
