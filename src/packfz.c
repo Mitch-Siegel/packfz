@@ -3240,8 +3240,105 @@ static char *print_string_with_escapes(char *string)
     return out_str;
 }
 
+struct node_array_array{
+    node_array_t **buf;
+    size_t max;
+    size_t len;
+};
+
+typedef struct node_array_array node_array_array_t;
+
+void node_array_array__init(node_array_array_t *array)
+{
+    array->len = 0;
+    array->max = 0;
+    array->buf = NULL;
+}
+
+static void node_array_array__add(node_array_array_t *array, node_array_t *to_add) {
+    if (array->max <= array->len) {
+        const size_t n = array->len + 1;
+        size_t m = array->max;
+        if (m == 0) m = ARRAY_MIN_SIZE;
+        while (m < n && m != 0) m <<= 1;
+        if (m == 0) m = n; /* in case of shift overflow */
+        array->buf = (node_array_t **)realloc_e(array->buf, sizeof(node_array_t *) * m);
+        array->max = m;
+    }
+    array->buf[array->len++] = to_add;
+}
+
+void node_array_array__term(node_array_array_t *array)
+{
+    free(array->buf);
+}
+
+static node_array_array_t *node_array_array_new()
+{
+    node_array_array_t *wip = malloc(sizeof(node_array_array_t));
+    node_array_array__init(wip);
+    return wip;
+}
+
+node_array_t *node_array__copy(node_array_t *array)
+{
+    node_array_t *copied = malloc(sizeof(node_array_t));
+    node_array__init(copied);
+    copied->len = array->len;
+    copied->max = array->max;
+    copied->buf = malloc(copied->max * sizeof(node_t *));
+    memcpy(copied->buf, array->buf, copied->max * sizeof(node_t *));
+
+    return copied;
+}
+
+node_array_array_t *node_array_array__merge(node_array_array_t *a, node_array_array_t *b)
+{
+    if((a == NULL) && (b == NULL))
+    {
+        return node_array_array_new();
+    }
+    else
+    {
+        if(a == NULL)
+        {
+            return b;
+        }
+
+        if(b == NULL)
+        {
+            return a;
+        }
+    }
+
+    if(a->len < b->len)
+    {
+        while(a->len > 0)
+        {
+            a->len--;
+            node_array_array__add(b, a->buf[a->len]);
+        }
+        node_array_array__term(a);
+        free(a);
+        return b;
+    }
+    else
+    {
+        while(b->len > 0)
+        {
+            b->len--;
+            node_array_array__add(a, b->buf[b->len]);
+        }
+        node_array_array__term(b);
+        free(b);
+        return a;
+    }
+}
+
 struct fuzz_results {
     char *in_str;
+    node_array_array_t node_expansions;
+    
     string_array_t outputs;
 };
 
@@ -3252,6 +3349,7 @@ fuzz_results_t *create_new_fuzz_results(char *in_str)
     fuzz_results_t *wip_results = malloc(sizeof(fuzz_results_t));
     wip_results->in_str = in_str;
     string_array__init(&wip_results->outputs);
+    node_array_array__init(&wip_results->node_expansions);
 
     return wip_results;
 }
@@ -3290,7 +3388,6 @@ fuzz_results_t *fuzz_results_merge(fuzz_results_t *a, fuzz_results_t *b)
     }
     return a;
 }
-
 
 void fuzz_results_print(fuzz_results_t *results)
 {
@@ -3351,7 +3448,6 @@ size_t fuzz_results_filter(context_t *ctx, fuzz_results_t *results)
     return n_all_whitespace;
 }
 
-
 char *string_append(char *str, char *to_add)
 {
     char *appended = malloc(strlen(str) + strlen(to_add) + 1);
@@ -3363,7 +3459,7 @@ char *string_append(char *str, char *to_add)
 }
 
 #define DEFAULT_MAX_EXPANSION_DEPTH 8
-#define DEFAULT_MAX_STAR_EXPANSION 1
+#define DEFAULT_MAX_STAR_EXPANSION 4
 #define DEFAULT_MIN_FUZZ_LENGTH 2
 // #define PRINT_DEPTH_LIMIT_EXCEEDED (deoth) print_indent(depth); printf("depth limit exceeded - abandon\n");
 #define PRINT_DEPTH_LIMIT_EXCEEDED
@@ -3375,433 +3471,258 @@ char *string_append(char *str, char *to_add)
 // #define PRINT_EXPANSION(depth, what) print_indent(depth); printf("Expand %s at depth %zu\n", what, depth);
 // #define PRINT_DONE_EXPANSION(depth, what) print_indent(depth); printf("Done expanding %s at depth %zu\n", what, depth);
 
+static node_array_array_t *rule_expansions = NULL;
 
-static fuzz_results_t *fuzz_expand(context_t *ctx, node_t *node, size_t depth, char *in_str);
+static node_array_array_t *expand_generic(node_array_t *wip, node_t *expanded);
 
-static fuzz_results_t *fuzz_expand_rule(context_t *ctx, node_rule_t *rule, size_t depth, char *in_str)
+static node_array_array_t *expand_direct(node_array_t *wip, node_t *expanded)
 {
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "RULE");
-    // printf("rule is %s\n", rule->name);
+    node_array_array_t *expansions = node_array_array_new();
 
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
+    // directly add the expanded node to the array
+    node_array_t *added = node_array__copy(wip);
+    node_array__add(added, expanded);
 
-    results = fuzz_results_merge(results, fuzz_expand(ctx, rule->expr, depth, in_str));
-
-    PRINT_DONE_EXPANSION(depth, "RULE");
-    return results;
+    // that's it
+    node_array_array__add(expansions, added);
+    return expansions;
 }
 
-static fuzz_results_t *fuzz_expand_reference(context_t *ctx, node_reference_t *reference, size_t depth, char *in_str)
+static node_array_array_t * expand_reference(node_array_t *wip, node_t *expanded)
 {
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "REFERENCE");
-
-    // printf("reference rule name is %d %s\n", reference->rule->type, reference->rule->data.rule.name);
-    fuzz_results_t *results = fuzz_expand(ctx, (node_t *)reference->rule, depth, in_str);
-
-    PRINT_DONE_EXPANSION(depth, "REFERENCE");
-    return results;
+    assert(expanded->type == NODE_REFERENCE);
+    node_reference_t *reference = &expanded->data.reference;
+    printf("expand reference %s\n", reference->name);
+    expand_generic(wip, (node_t *)reference->rule);
 }
 
-static fuzz_results_t *fuzz_expand_string(context_t *ctx, node_string_t *string, size_t depth, char *in_str)
+static node_array_array_t * expand_quantity(node_array_t *wip, node_t *expanded)
 {
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "STRING");
+    assert(expanded->type == NODE_QUANTITY);
+    node_array_array_t *expansions = node_array_array_new();
+    node_quantity_t *quantity = &expanded->data.quantity;
 
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
-    char *result_str = string_append(strdup(in_str), string->value);
-    fuzz_results_add(results, result_str);
-    free(result_str);
-
-    PRINT_DONE_EXPANSION(depth, "STRING");
-
-    return results;
-}
-
-static fuzz_results_t *fuzz_chars_in_range(context_t *ctx, fuzz_results_t *results, char start, char end, char *appended_in_str, size_t char_index, bool_t invert)
-{
-    if(ctx->opts.stochastic)
-    {
-        char rand_char = '\0';
-        if(!invert)
-            {
-                while (!(rand_char >= start && rand_char <= end))
-                {
-                    rand_char = rand() % ('~' - ' ');
-                }
-            }
-            else
-            {
-                if(rand_char >= start && rand_char <= end)
-                {
-                    rand_char = rand() % ('~' - ' ');
-                }
-            }
-        appended_in_str[char_index] = rand_char;
-        fuzz_results_add(results, appended_in_str);
-    }
-    else
-    {
-        for(char c = ' '; c <= '~'; c++)
-        {
-            if(!invert)
-            {
-                if(!(c >= start && c <= end))
-                {
-                    appended_in_str[char_index] = c;
-                }
-            }
-            else
-            {
-                if(c >= start && c <= end)
-                {
-                    appended_in_str[char_index] = c;
-                }
-            }
-
-            fuzz_results_add(results, appended_in_str);
-        }
-    }
-}
-
-static fuzz_results_t *fuzz_expand_charclass(context_t *ctx, node_charclass_t *charclass, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "CHARCLASS");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
-    char *appended_char_string = string_append(strdup(in_str), " ");
-    size_t char_index = strlen(in_str);
-
-    char *value = charclass->value;
-    char start;
-    char end;
-    // TODO: support inverse class matching ex. [^0-9]
-    if(charclass->value == NULL)
-    {
-        fuzz_chars_in_range(ctx, results, 0, 128, appended_char_string, char_index, FALSE);
-    }
-    else
-    {
-        const size_t n = strlen(charclass->value);
-        if(n > 0)
-        {
-            if(n > 1)
-            {
-                const bool_t is_inverted_class = (value[0] == '^') ? TRUE : FALSE;
-                size_t i = is_inverted_class ? 1 : 0;
-                if (i + 1 == n)
-                {
-                    appended_char_string[char_index] = value[i];
-                    fuzz_results_add(results, appended_char_string);
-                }
-                else
-                {
-                    if((i+3 == n) && (value[i] != '\\') && value[i+1] == '-')
-                    {
-                        fuzz_chars_in_range(ctx, results, value[i], value[i + 2], appended_char_string, char_index, is_inverted_class);
-                    }
-                    else
-                    {
-                        if(ctx->opts.stochastic)
-                        {
-                            size_t rand_from_class_idx = rand() % (n - i);
-                            rand_from_class_idx += i;
-                            appended_char_string[char_index] = value[rand_from_class_idx];
-                            fuzz_results_add(results, appended_char_string);
-                        }
-                        else
-                        {
-                            for(; i < n; i++)
-                            {
-                                appended_char_string[char_index] = value[i];
-                                fuzz_results_add(results, appended_char_string);
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-                appended_char_string[char_index] = charclass->value[0];
-                fuzz_results_add(results, appended_char_string);
-            }
-        }
-    }
-
-    free(appended_char_string);
-
-    PRINT_DONE_EXPANSION(depth, "CHARCLASS");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_quantity(context_t *ctx, node_quantity_t *quantity, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "QUANTITY");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
+    node_array_t empty_expansion;
+    node_array__init(&empty_expansion);
+    node_array_array_t *expand_from = expand_generic(&empty_expansion, quantity->expr);
 
     int min_count = quantity->min;
     int max_count = quantity->max;
 
     if(max_count == -1)
     {
-        max_count = ctx->opts.maxstar;
+        max_count = DEFAULT_MAX_STAR_EXPANSION;
     }
 
-    if(max_count < min_count)
+    if(min_count > max_count)
     {
-        int temp = max_count;
-        max_count = min_count;
-        min_count = temp;
+        int temp = min_count;
+        min_count = max_count;
+        max_count = temp;
     }
 
-    int rand_count;
-    if(ctx->opts.stochastic)
+    printf("EXPAND QUANT - counts are min-max %d-%d\n", min_count,max_count);
+    node_array_t *added = NULL;
+    if(min_count == 0)
     {
-        rand_count = rand() % ((max_count - min_count) + 1);
-        rand_count += min_count;
+        node_array_array__add(expansions, node_array__copy(wip));
     }
 
-    // printf("QUANTITY - between %d and %d\n", min_count, max_count);
-
-    fuzz_results_t *expr_results = fuzz_expand(ctx, quantity->expr, depth, "");
-
-    if(expr_results != NULL)
+    for(int cur_count = min_count; cur_count <= max_count; cur_count++)
     {
-        for(size_t expr_result_idx = 0; expr_result_idx < expr_results->outputs.len; expr_result_idx++)
+        printf("expanding at cur count %d\n", cur_count);
+        for(int i = 0; i < cur_count; i++)
         {
-            char *expr_output = expr_results->outputs.buf[expr_result_idx];
-            char *result = strdup(in_str);
-
-            if(ctx->opts.stochastic)
+            printf("yoink\n");
+            for(size_t exp_from_idx = 0; exp_from_idx < expand_from->len; exp_from_idx++)
             {
-                for(int count = 0; count < rand_count; count++)
+                node_array_t *expansion = expand_from->buf[exp_from_idx];
+                added = node_array__copy(wip);
+                for(size_t exp_idx = 0; exp_idx < expansion->len; exp_idx++)
                 {
-                    result = string_append(result, expr_output);
+                    printf("add exp\n");
+                    node_array__add(added, expansion->buf[exp_idx]);
                 }
-                fuzz_results_add(results, result);
+                node_array_array__add(expansions, added);
             }
-            else
-            {
-                for(int count = 0; count < min_count - 1; count++)
-                {
-                    result = string_append(result, expr_output);
-                }
-                
-                for(int count = min_count; count <= max_count; count++)
-                {
-                    result = string_append(result, expr_output);
-                    fuzz_results_add(results, result);
-                }
-            }
-            free(result);
-        }
-
-        fuzz_results_term(expr_results);
-    }
-
-
-    PRINT_DONE_EXPANSION(depth, "QUANTITY");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_predicate(context_t *ctx, node_predicate_t *predicate, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "PREDICATE");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
-    if(predicate->neg)
-    {
-        fuzz_results_add(results, in_str);
-    }
-    else
-    {
-        results = fuzz_results_merge(results, fuzz_expand(ctx, predicate->expr, depth, in_str));
-    }
-
-
-    PRINT_DONE_EXPANSION(depth, "PREDICATE");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_sequence(context_t *ctx, node_sequence_t *sequence, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "SEQUENCE");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
-    fuzz_results_add(results, in_str);
-
-    for(size_t sequence_idx = 0; sequence_idx < sequence->nodes.len; sequence_idx++)
-    {
-        fuzz_results_t *new_results = create_new_fuzz_results(in_str);
-        for(size_t result_idx = 0; result_idx < results->outputs.len; result_idx++)
-        {
-            // printf("Expanding index %zu of sequence from [%s]\n", sequence_idx, results->outputs.buf[result_idx]);
-            fuzz_results_t *sequence_member_results = fuzz_expand(ctx, sequence->nodes.buf[sequence_idx], depth, results->outputs.buf[result_idx]);
-            if(sequence_member_results == NULL)
-            {
-                // printf("abandon sequence\n");
-                fuzz_results_term(new_results);
-                fuzz_results_term(results);
-                return NULL;
-            }
-            else
-            {
-                new_results = fuzz_results_merge(new_results, sequence_member_results);
-            }
-        }
-
-        fuzz_results_term(results);
-        results = new_results;
-    }
-
-    PRINT_DONE_EXPANSION(depth, "SEQUENCE");
-
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_alternate(context_t *ctx, node_alternate_t *alternate, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "ALTERNATE");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-
-    if(ctx->opts.stochastic)
-    {
-        size_t idx = rand() % alternate->nodes.len;
-        results = fuzz_results_merge(results, fuzz_expand(ctx, alternate->nodes.buf[idx], depth, in_str));
-    }
-    else
-    {
-        for(size_t alternate_idx = 0; alternate_idx < alternate->nodes.len; alternate_idx++)
-        {
-            results = fuzz_results_merge(results, fuzz_expand(ctx, alternate->nodes.buf[alternate_idx], depth, in_str));
         }
     }
 
-    PRINT_DONE_EXPANSION(depth, "ALTERNATE");
-    return results;
+
+    // for(int i = min_count; i < max_count; i++)
+    // {
+    //     node_array__add(added, expanded);
+    //     node_array_t *copied = node_array__copy(added);
+    //     node_array_array__add(expansions, added);
+    //     added = copied;
+    // }
+
+    // free(added->buf);
+    // free(added);
+
+    return expansions;
 }
 
-static fuzz_results_t *fuzz_expand_capture(context_t *ctx, node_capture_t *capture, size_t depth, char *in_str)
+static node_array_array_t *expand_sequence(node_array_t *wip, node_t *expanded)
 {
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "CAPTURE");
+    assert(expanded->type == NODE_SEQUENCE);
+    node_sequence_t *sequence = &expanded->data.sequence;
+    printf("expand reference\n");
 
-    fuzz_results_t *results = fuzz_expand(ctx, capture->expr, depth, in_str);
+    node_array_array_t *expansions = node_array_array_new();
+    node_array_array__add(expansions, wip);
 
-    PRINT_DONE_EXPANSION(depth, "CAPTURE");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_expand(context_t *ctx, node_expand_t *expand, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "EXPAND");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-    fuzz_results_add(results, in_str);
-
-    PRINT_DONE_EXPANSION(depth, "EXPAND");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_action(context_t *ctx, node_action_t *action, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "ACTION");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-    fuzz_results_add(results, in_str);
-
-
-    PRINT_DONE_EXPANSION(depth, "ACTION");
-    return results;
-}
-
-static fuzz_results_t *fuzz_expand_error(context_t *ctx, node_error_t *error, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-    PRINT_EXPANSION(depth, "ERROR");
-
-    fuzz_results_t *results = create_new_fuzz_results(in_str);
-    fuzz_results_add(results, in_str);
-
-    PRINT_DONE_EXPANSION(depth, "ERROR");    
-    return results;
-}
-
-
-
-static fuzz_results_t *fuzz_expand(context_t *ctx, node_t *node, size_t depth, char *in_str)
-{
-    CHECK_EXPANSION_DEPTH(depth, ctx->opts.maxdepth);
-
-    fuzz_results_t *results = NULL;
-
-    switch(node->type)
+    for(size_t idx = 0; idx < sequence->nodes.len; idx++)
     {
-        case NODE_RULE:
-            results = fuzz_expand_rule(ctx, &node->data.rule, depth + 1, in_str);
-            break;
-
-        case NODE_REFERENCE:
-            results = fuzz_expand_reference(ctx, &node->data.reference, depth + 1, in_str);
-            break;
-
-        case NODE_STRING:
-            results = fuzz_expand_string(ctx, &node->data.string, depth + 1, in_str);
-            break;
-
-        case NODE_CHARCLASS:
-            results = fuzz_expand_charclass(ctx, &node->data.charclass, depth + 1, in_str);
-            break;
-
-        case NODE_QUANTITY:
-            results = fuzz_expand_quantity(ctx, &node->data.quantity, depth + 1, in_str);
-            break;
-
-        case NODE_PREDICATE:
-            results = fuzz_expand_predicate(ctx, &node->data.predicate, depth + 1, in_str);
-            break;
-
-        case NODE_SEQUENCE:
-            results = fuzz_expand_sequence(ctx, &node->data.sequence, depth + 1, in_str);
-            break;
-
-        case NODE_ALTERNATE:
-            results = fuzz_expand_alternate(ctx, &node->data.alternate, depth + 1, in_str);
-            break;
-
-        case NODE_CAPTURE:
-            results = fuzz_expand_capture(ctx, &node->data.capture, depth + 1, in_str);
-            break;
-
-        case NODE_EXPAND:
-            results = fuzz_expand_expand(ctx, &node->data.expand, depth + 1, in_str);
-            break;
-
-        case NODE_ACTION:
-            results = fuzz_expand_action(ctx, &node->data.action, depth + 1, in_str);
-        break;
-
-        case NODE_ERROR:
-            results = fuzz_expand_error(ctx, &node->data.error, depth + 1, in_str);
-        break;
+        node_t *sequence_member = sequence->nodes.buf[idx];
+        node_array_array_t *new_expansions = NULL;
+        for(size_t exp_idx = 0; exp_idx < expansions->len; exp_idx++)
+        {
+            node_array_t *expand_sequence_into = expansions->buf[exp_idx];
+            new_expansions = node_array_array__merge(new_expansions, expand_generic(expand_sequence_into, sequence_member));
+        }
+        node_array_array__term(expansions);
+        expansions = new_expansions;
     }
 
-    return results;
+    // make sure we return a non-null array
+    return node_array_array__merge(expansions, node_array_array_new());
+}
+
+static node_array_array_t *expand_alternate(node_array_t *wip, node_t *expanded)
+{
+    assert(expanded->type == NODE_ALTERNATE);
+    node_alternate_t *alternate = &expanded->data.alternate;
+    printf("expand reference\n");
+
+    node_array_array_t *expansions = NULL;
+
+    for(size_t idx = 0; idx < alternate->nodes.len; idx++)
+    {
+        node_t *alternate_member = alternate->nodes.buf[idx];
+        expansions = node_array_array__merge(expansions, expand_generic(wip, alternate_member));
+    }
+
+    // make sure we return a non-null array
+    return node_array_array__merge(expansions, node_array_array_new());
+}
+
+node_array_array_t *(*expansion_callbacks[NODE_ERROR + 1])(node_array_t *, node_t *) = {
+    [NODE_RULE] = expand_direct,
+    [NODE_REFERENCE] = expand_reference,
+    [NODE_STRING] = expand_direct,
+    [NODE_CHARCLASS] = expand_direct,
+    [NODE_QUANTITY] = expand_quantity,
+    [NODE_PREDICATE] = expand_direct,
+    [NODE_SEQUENCE] = expand_sequence,
+    [NODE_ALTERNATE] = expand_alternate,
+    [NODE_CAPTURE] = expand_direct,
+    [NODE_EXPAND] = expand_direct,
+    [NODE_ACTION] = expand_direct,
+    [NODE_ERROR] = expand_direct,
+};
+
+static node_array_array_t *expand_generic(node_array_t *wip, node_t *expanded)
+{
+    return expansion_callbacks[expanded->type](wip, expanded);
+}
+
+static void fuzz_expand(context_t *ctx)
+{
+    if(rule_expansions != NULL)
+    {
+        print_error("rule_expansions already set to non-null");
+        exit(-1);
+    }
+
+    rule_expansions = malloc(ctx->rules.len * sizeof(node_array_array_t));
+    for(size_t rule_idx = 0; rule_idx < ctx->rules.len; rule_idx++)
+    {
+        node_array_array_t *these_expansions = &rule_expansions[rule_idx];
+
+        node_t *rule_root = ctx->rules.buf[rule_idx];
+        node_array_t empty_expansion;
+        node_array__init(&empty_expansion);
+        node_array_array_t *returned_expansions = expand_generic(&empty_expansion, rule_root->data.rule.expr);
+        *these_expansions = *returned_expansions;
+        free(returned_expansions);
+    }
+}
+
+void print_rule_expansions(context_t *ctx)
+{
+    if(rule_expansions == NULL)
+    {
+        print_error("rule_expansions not initialized");
+        exit(-1);
+    }
+
+    for(size_t rule_idx = 0; rule_idx < ctx->rules.len; rule_idx++)
+    {
+        node_array_array_t *rule_array = &rule_expansions[rule_idx];
+        printf("rule %zu: %s\n", rule_idx, ctx->rules.buf[rule_idx]->data.rule.name);
+        for(size_t expansion_idx = 0; expansion_idx < rule_array->len; expansion_idx++)
+        {
+            printf("\t\texpansion %zu\n\t\t", expansion_idx);
+            node_array_t *expansion = rule_array->buf[expansion_idx];
+            for(size_t node_idx = 0; node_idx < expansion->len; node_idx++)
+            {
+                node_t *printed = expansion->buf[node_idx];
+                switch(printed->type)
+                {
+                    case NODE_RULE:
+                        printf("%s ", printed->data.rule.name);
+                        break;
+
+                    case NODE_REFERENCE:
+                        printf("NODE_REFERENCE ");
+                        break;
+                        
+                    case NODE_STRING:
+                        printf("%s ", printed->data.string.value);
+                        break;
+                        
+                    case NODE_CHARCLASS:
+                        printf("NODE_CHARCLASS ");
+                        break;
+                        
+                    case NODE_QUANTITY:
+                        printf("NODE_QUANTITY ");
+                        break;
+                        
+                    case NODE_PREDICATE:
+                        printf("NODE_PREDICATE ");
+                        break;
+                        
+                    case NODE_SEQUENCE:
+                        printf("NODE_SEQUENCE ");
+                        break;
+                        
+                    case NODE_ALTERNATE:
+                        printf("NODE_ALTERNATE ");
+                        break;
+                        
+                    case NODE_CAPTURE:
+                        printf("NODE_CAPTURE ");
+                        break;
+                        
+                    case NODE_EXPAND:
+                        printf("NODE_EXPAND ");
+                        break;
+                        
+                    case NODE_ACTION:
+                        printf("NODE_ACTION ");
+                        break;
+                        
+                    case NODE_ERROR:
+                        printf("NODE_ERROR ");
+                        break;
+
+                }
+            }
+            printf("\n");
+        }
+    }
 }
 
 #include "time.h"
@@ -3810,25 +3731,14 @@ static bool_t fuzz(context_t *ctx)
     printf("fuzzing %s with max depth of %d\n", ctx->opts.stochastic ? "stochastically" : "", ctx->opts.maxdepth);
     srand(time(0));
 
-    fuzz_results_t *results = create_new_fuzz_results("");
+    fuzz_expand(ctx);
+    print_rule_expansions(ctx);
 
-    for(size_t rule_idx = 0; rule_idx < ctx->rules.len; rule_idx++)
+    for(size_t idx = 0; idx < ctx->rules.len; idx++)
     {
-        node_t *rule_node = ctx->rules.buf[rule_idx];
-        if(rule_node->type != NODE_RULE)
-        {
-            print_error("Saw non-rule node type at rule index %zu\n", rule_idx);
-            return FALSE;
-        }
-        results = fuzz_results_merge(results, fuzz_expand(ctx, rule_node, 0, ""));
+        node_array_array__term(&rule_expansions[idx]);
     }
 
-    size_t n_all_whitespace = fuzz_results_filter(ctx, results);
-    printf("filtered %zu fuzz outputs which were all whitespace or didn't meet minimum length\n", n_all_whitespace);
-
-    fuzz_results_print(results);
-
-    fuzz_results_term(results);
 }
 
 static void print_version(FILE *output) {
